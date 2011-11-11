@@ -274,7 +274,6 @@ int BIO_poll(BIO_poller* s, int64_t timeoutns) {
 		}
 	}
 
-	s->die = 0;
 	return s->exit_code;
 }
 

@@ -2,19 +2,21 @@
 
 #include <bio_poll.h>
 #include <openssl/bio.h>
+#include <openssl/ssl.h>
 
-static BIO* gbio;
 static BIO_poller* gpoller;
 
 static void onwrite(void* arg) {
-    (void) BIO_flush(gbio);
+	BIO* b = (BIO*) arg;
+	BIO_shutdown_wr(b);
 }
 
 static void onread(void* arg) {
+	BIO* b = (BIO*) arg;
 	char buf[4096];
 	for (;;) {
-		int ret = BIO_read(gbio, buf, sizeof(buf));
-		if (ret <= 0 && !BIO_should_retry(gbio)) {
+		int ret = BIO_read(b, buf, sizeof(buf));
+		if (ret <= 0 && !BIO_should_retry(b)) {
 			BIO_exit_poll(gpoller, 0);
 		}
 
@@ -27,21 +29,33 @@ static void onread(void* arg) {
 }
 
 int main(void) {
+	BIO* b;
+	SSL_CTX* ctx;
+
+	SSL_load_error_strings();
+	SSL_library_init();
+	ctx = SSL_CTX_new(TLSv1_client_method());
+
+	b = BIO_new_connect("www.google.com:443");
+	b = BIO_push(BIO_new_ssl(ctx, 1), b);
+	b = BIO_push(BIO_new(BIO_f_buffer()), b);
+	b = BIO_push(BIO_new(BIO_f_poll()), b);
+
 	gpoller = BIO_new_poller(0);
-	gbio = BIO_new_connect("www.google.com:80");
-	gbio = BIO_push(BIO_new(BIO_f_buffer()), gbio);
-	gbio = BIO_push(BIO_new(BIO_f_poll()), gbio);
 
-	BIO_set_poller(gbio, gpoller);
-	BIO_set_read_callback(gbio, &onread);
-    BIO_set_write_callback(gbio, &onwrite);
+	BIO_set_poller(b, gpoller);
+	BIO_set_read_callback(b, &onread);
+	BIO_set_read_arg(b, b);
+	BIO_set_write_callback(b, &onwrite);
+	BIO_set_write_arg(b, b);
 
-	BIO_puts(gbio, "GET / HTTP/1.0\r\n\r\n");
+	BIO_puts(b, "GET / HTTP/1.0\r\n\r\n");
+	BIO_shutdown_wr(b);
 
-    onwrite(NULL);
-    onread(NULL);
+	onread(b);
+
 	BIO_poll(gpoller, -1);
-	BIO_free_all(gbio);
+	BIO_free_all(b);
 	BIO_free_poller(gpoller);
 	return 0;
 }

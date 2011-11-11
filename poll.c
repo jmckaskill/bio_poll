@@ -37,6 +37,27 @@ static int poll_new(BIO* b) {
 	return 1;
 }
 
+static int register_poll(struct poll* s, BIO* next) {
+	/* someone down the chain is handling the callback */
+	if (BIO_set_read_callback(next, s->read_cb) && BIO_set_write_callback(next, s->write_cb)) {
+		BIO_set_read_arg(next, s->read_arg);
+		BIO_set_write_arg(next, s->write_arg);
+		s->delegated = 1;
+		return 1;
+	}
+
+	BIO_get_fd(next, &s->fd);
+
+	/* no way for us to wait without a fd, we will try to get the
+	 * fd next time we hit a read retry */
+	if (s->fd < 0) {
+		return 1;
+	}
+
+	add_poll(s, s->read | s->write);
+	return 0;
+}
+
 static void disconnect(struct poll* s, BIO* next) {
 	if (s->registered) {
 		remove_poll(s);
@@ -50,9 +71,9 @@ static void disconnect(struct poll* s, BIO* next) {
 	s->fd = -1;
 	s->read = 0;
 	s->write = 0;
-	s->read_after_write = 0;
-	s->write_after_read = 0;
 	s->delegated = 0;
+	s->read_finished = 0;
+	s->write_finished = 0;
 }
 
 static int poll_free(BIO* b) {
@@ -67,73 +88,62 @@ static int poll_free(BIO* b) {
 	return 1;
 }
 
-static int on_either(struct poll* s, BIO* next, int ret) {
-	int read = s->read || s->write_after_read;
-	int write = s->write || s->read_after_write;
+static void on_read(BIO* b, int ret) {
+	struct poll* s = (struct poll*) b->ptr;
+	BIO* next = b->next_bio;
 
-	/* We are not handling updates */
-	if (!s->poller || s->delegated) {
-		return ret;
-	}
-
-	/* success - turn off wait */
 	if (ret > 0) {
-		update_poll(s, read, write);
-		return ret;
+		s->read = 0;
+	} else {
+		int rr = BIO_should_io_special(next) ? BIO_get_retry_reason(next) : 0;
+		s->read = (BIO_should_write(next) ? POLL_WRITE : 0)
+			| (BIO_should_read(next) ? POLL_READ : 0)
+			| (rr == BIO_RR_CONNECT ? POLL_CONNECT : 0)
+			| (rr == BIO_RR_ACCEPT ? POLL_ACCEPT : 0);
 	}
 
-	/* read/write fatal error or clean disconnect */
+	if (ret == 0 && !BIO_should_retry(next)) {
+		s->read_finished = 1;
+	}
+
+	BIO_copy_next_retry(b);
+
+	if (!s->poller || s->delegated || !s->registered) {
+		return;
+	}
+
 	if ((ret < 0 && !BIO_should_retry(next)) || (s->read_finished && s->write_finished)) {
 		disconnect(s, next);
-		return ret;
+	} else {
+		update_poll(s, s->read | s->write);
 	}
-
-	/* nothing we can wait on */
-	if (!read && !write && !s->registered) {
-		return ret;
-	}
-
-	/* We need to wait, try and get the fd */
-	if (s->fd < 0) {
-		/* someone down the chain is handling the callback */
-		if (BIO_set_read_callback(next, s->read_cb) && BIO_set_write_callback(next, s->write_cb)) {
-			BIO_set_read_arg(next, s->read_arg);
-			BIO_set_write_arg(next, s->write_arg);
-			s->delegated = 1;
-			return ret;
-		}
-
-		BIO_get_fd(next, &s->fd);
-
-		/* no way for us to wait without a fd, we will try to get the
-		 * fd next time we hit a read retry */
-		if (s->fd < 0) {
-			return ret;
-		}
-	}
-
-	update_poll(s, read, write);
-
-	return ret;
 }
 
-#define should_connect(b) (BIO_should_io_special(b) && BIO_get_retry_reason(b) == BIO_RR_CONNECT)
-#define should_accept(b) (BIO_should_io_special(b) && BIO_get_retry_reason(b) == BIO_RR_ACCEPT)
+static void on_write(BIO* b, int ret) {
+	struct poll* s = (struct poll*) b->ptr;
+	BIO* next = b->next_bio;
+	int rr = BIO_should_io_special(next) ? BIO_get_retry_reason(next) : 0;
 
-static int on_read(struct poll* s, BIO* next, int ret) {
-	s->read = ret <= 0 && (BIO_should_read(next) || should_accept(next));
-	s->read_after_write = ret <= 0 && (BIO_should_write(next) || should_connect(next));
-	s->read_finished = ret <= 0 && !BIO_should_retry(next);
+	if (ret > 0) {
+		s->write = 0;
+	} else {
+		s->write = (BIO_should_write(next) ? POLL_WRITE : 0)
+			| (BIO_should_read(next) ? POLL_READ : 0)
+			| (rr == BIO_RR_CONNECT ? POLL_CONNECT : 0)
+			| (rr == BIO_RR_ACCEPT ? POLL_ACCEPT : 0);
+	}
 
-	return on_either(s, next, ret);
-}
+	BIO_copy_next_retry(b);
 
-static int on_write(struct poll* s, BIO* next, int ret) {
-	s->write = ret <= 0 && (BIO_should_write(next) || should_connect(next));
-	s->write_after_read = ret <= 0 && (BIO_should_read(next) || should_accept(next));
-	s->write_finished = ret <= 0 && !BIO_should_retry(next);
+	if (!s->poller || s->delegated || !s->registered) {
+		return;
+	}
 
-	return on_either(s, next, ret);
+	if ((ret < 0 && !BIO_should_retry(next)) || (s->read_finished && s->write_finished)) {
+		disconnect(s, next);
+	} else {
+		update_poll(s, s->read | s->write);
+	}
 }
 
 static int poll_gets(BIO* b, char* buf, int sz) {
@@ -145,9 +155,21 @@ static int poll_gets(BIO* b, char* buf, int sz) {
 		return 0;
 	}
 
+	BIO_clear_retry_flags(b);
+
 	ret = BIO_gets(next, buf, sz);
-	BIO_copy_next_retry(b);
-	return on_read(s, next, ret);
+	on_read(b, ret);
+
+	if (s->read && !s->registered) {
+		if (register_poll(s, next)) {
+			return ret;
+		}
+
+		ret = BIO_gets(next, buf, sz);
+		on_read(b, ret);
+	}
+
+	return ret;
 }
 
 static int poll_read(BIO* b, char* buf, int sz) {
@@ -159,9 +181,21 @@ static int poll_read(BIO* b, char* buf, int sz) {
 		return 0;
 	}
 
+	BIO_clear_retry_flags(b);
+
 	ret = BIO_read(next, buf, sz);
-	BIO_copy_next_retry(b);
-	return on_read(s, next, ret);
+	on_read(b, ret);
+
+	if (s->read && !s->registered) {
+		if (register_poll(s, next)) {
+			return ret;
+		}
+
+		ret = BIO_read(next, buf, sz);
+		on_read(b, ret);
+	}
+
+	return ret;
 }
 
 static int poll_write(BIO* b, const char* buf, int sz) {
@@ -173,9 +207,24 @@ static int poll_write(BIO* b, const char* buf, int sz) {
 		return 0;
 	}
 
+	BIO_clear_retry_flags(b);
+
 	ret = BIO_write(next, buf, sz);
-	BIO_copy_next_retry(b);
-	return on_write(s, next, ret);
+	on_write(b, ret);
+
+	/* If we haven't registered, we need to retry after registering to
+         * handle edge triggered polling.
+         */
+	if (s->write && !s->registered) {
+		if (register_poll(s, next)) {
+			return ret;
+		}
+
+		ret = BIO_write(next, buf, sz);
+		on_write(b, ret);
+	}
+
+	return ret;
 }
 
 static int poll_puts(BIO* b, const char* str) {
@@ -187,9 +236,21 @@ static int poll_puts(BIO* b, const char* str) {
 		return 0;
 	}
 
+	BIO_clear_retry_flags(b);
+
 	ret = BIO_puts(next, str);
-	BIO_copy_next_retry(b);
-	return on_write(s, next, ret);
+	on_write(b, ret);
+
+	if (s->write && !s->registered) {
+		if (register_poll(s, next)) {
+			return ret;
+		}
+
+		ret = BIO_puts(next, str);
+		on_write(b, ret);
+	}
+
+	return ret;
 }
 
 static long poll_callback_ctrl(BIO* b, int cmd, bio_info_cb* fp) {
@@ -219,7 +280,7 @@ static long poll_callback_ctrl(BIO* b, int cmd, bio_info_cb* fp) {
 static long poll_ctrl(BIO* b, int cmd, long larg, void* parg) {
 	BIO* next = b->next_bio;
 	struct poll* s = (struct poll*) b->ptr;
-	long ret;
+	int ret;
 
 	switch (cmd) {
 	case BIO_C_SET_READ_ARG:
@@ -230,9 +291,9 @@ static long poll_ctrl(BIO* b, int cmd, long larg, void* parg) {
 		return 1;
 
 	case BIO_C_SET_WRITE_ARG:
-		s->read_arg = parg;
+		s->write_arg = parg;
 		if (s->delegated) {
-			BIO_set_write_arg(next, s->read_arg);
+			BIO_set_write_arg(next, s->write_arg);
 		}
 		return 1;
 
@@ -245,25 +306,50 @@ static long poll_ctrl(BIO* b, int cmd, long larg, void* parg) {
 		return 1;
 
 	case BIO_CTRL_FLUSH:
+		BIO_clear_retry_flags(b);
 		ret = BIO_ctrl(next, cmd, larg, parg);
-		if (!ret) {
+
+		/* 0 means flushing isn't supported */
+		if (ret == 0) {
 			return ret;
 		}
 
-		BIO_copy_next_retry(b);
-		return on_write(s, next, (int) ret);
+		on_write(b, ret);
+		if (s->write && !s->registered) {
+			if (register_poll(s, next)) {
+				return ret;
+			}
 
-	case BIO_CTRL_EOF:
-		ret = BIO_ctrl(next, cmd, larg, parg);
-		if (!ret) {
-			return ret;
+			ret = BIO_ctrl(next, cmd, larg, parg);
+			on_write(b, ret);
 		}
 
-		s->write = 0;
-		s->write_after_read = 0;
+		return ret;
+
+	case BIO_C_SHUTDOWN_WR:
+		BIO_clear_retry_flags(b);
 		s->write_finished = 1;
+		s->write = 0;
+		ret = BIO_ctrl(next, cmd, larg, parg);
 
-		return on_either(s, next, (int) ret);
+		/* If the underlying bio doesn't support write shutdown, we
+                 * convert it into a request to flush.
+                 */
+		if (ret == 0) {
+			return BIO_flush(b);
+		}
+
+		on_write(b, ret);
+		if (s->write && !s->registered) {
+			if (register_poll(s, next)) {
+				return ret;
+			}
+
+			ret = BIO_ctrl(next, cmd, larg, parg);
+			on_write(b, ret);
+		}
+
+		return ret;
 
 	default:
 		return BIO_ctrl(next, cmd, larg, parg);

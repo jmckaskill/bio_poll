@@ -2,6 +2,7 @@
 #pragma once
 
 #include <openssl/bio.h>
+#include <stdint.h>
 
 typedef struct BIO_poller BIO_poller;
 
@@ -23,7 +24,7 @@ BIO_METHOD* BIO_f_poll(void);
 
 typedef void (*BIO_poll_fn)(void*);
 
-#define BIO_set_read_callback(b,cb) BIO_callback_ctrl(b, BIO_C_SET_READ_CALLBACK, (void (*)()) (cb))
+#define BIO_set_read_callback(b,cb) BIO_callback_ctrl(b, BIO_C_SET_READ_CALLBACK, (void (*)(struct bio_st *, int, const char *, int, long, long)) (cb))
 #define BIO_set_read_arg(b,u) BIO_ctrl(b, BIO_C_SET_READ_ARG, 0, u)
-#define BIO_set_write_callback(b,cb) BIO_callback_ctrl(b, BIO_C_SET_WRITE_CALLBACK, (void (*)()) (cb))
+#define BIO_set_write_callback(b,cb) BIO_callback_ctrl(b, BIO_C_SET_WRITE_CALLBACK, (void (*)(struct bio_st *, int, const char *, int, long, long)) (cb))
 #define BIO_set_write_arg(b,u) BIO_ctrl(b, BIO_C_SET_WRITE_ARG, 0, u)

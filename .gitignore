@@ -1,2 +1,6 @@
 *.xcodeproj
 *.swp
+*.vcproj
+/Debug
+/Release
+*.user
