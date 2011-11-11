@@ -9,6 +9,7 @@
 #include <sys/event.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include <unistd.h>
 
 DVECTOR_INIT(kevent, struct kevent);
 
@@ -70,23 +71,35 @@ static struct thread* get_thread(BIO_poller* s) {
 	return t;
 }
 
-void update_read(struct poll* p, int enabled) {
-	struct thread* t = get_thread(p->poller);
-	struct kevent* e = dv_append_buffer(&t->changes, 1);
-	EV_SET(e, p->fd, EVFILT_READ, enabled ? EV_ENABLE : EV_DISABLE, 0, 0, p);
-}
+void update_poll(struct poll* p, int read, int write) {
+	if (p->wait_read == read && p->wait_write == write) {
+		return;
+	}
+       
+	if (!p->registered) {
+		struct thread* t = get_thread(p->poller);
+		struct kevent* e = dv_append_buffer(&t->changes, 2);
+		EV_SET(&e[0], p->fd, EVFILT_READ, EV_ADD | (read ? EV_ENABLE : EV_DISABLE), 0, 0, p);
+		EV_SET(&e[1], p->fd, EVFILT_WRITE, EV_ADD | (write ? EV_ENABLE : EV_DISABLE), 0, 0, p);
 
-void update_write(struct poll* p, int enabled) {
-	struct thread* t = get_thread(p->poller);
-	struct kevent* e = dv_append_buffer(&t->changes, 1);
-	EV_SET(e, p->fd, EVFILT_WRITE, enabled ? EV_ENABLE : EV_DISABLE, 0, 0, p);
-}
+	} else if (!p->in_callback) {
 
-void add_poll(struct poll* p, int read, int write) {
-	struct thread* t = get_thread(p->poller);
-	struct kevent* e = dv_append_buffer(&t->changes, 2);
-	EV_SET(&e[0], p->fd, EVFILT_READ, EV_ADD | (read ? EV_ENABLE : EV_DISABLE), 0, 0, p);
-	EV_SET(&e[1], p->fd, EVFILT_WRITE, EV_ADD | (write ? EV_ENABLE : EV_DISABLE), 0, 0, p);
+		if (p->wait_write != read) {
+			struct thread* t = get_thread(p->poller);
+			struct kevent* e = dv_append_buffer(&t->changes, 1);
+			EV_SET(e, p->fd, EVFILT_READ, read ? EV_ENABLE : EV_DISABLE, 0, 0, p);
+		}
+
+		if (p->wait_write != write) {
+			struct thread* t = get_thread(p->poller);
+			struct kevent* e = dv_append_buffer(&t->changes, 1);
+			EV_SET(e, p->fd, EVFILT_WRITE, write ? EV_ENABLE : EV_DISABLE, 0, 0, p);
+		}
+	}
+
+	p->registered = 1;
+	p->wait_write = write;
+	p->wait_write = read;
 }
 
 void remove_poll(struct poll* p) {
@@ -104,12 +117,16 @@ void remove_poll(struct poll* p) {
 			t->events.data[i].udata = NULL;
 		}
 	}
+
+	p->wait_read = 0;
+	p->wait_write = 0;
+	p->registered = 0;
 }
 
 BIO_poller* BIO_new_poller(int threads) {
 	BIO_poller* s = (BIO_poller*) calloc(1, sizeof(BIO_poller));
 	s->threads = threads;
-    s->kq = kqueue();
+	s->kq = kqueue();
 
 	if (threads) {
 		pthread_key_create(&s->key, &free_thread);
@@ -132,8 +149,8 @@ void BIO_free_poller(BIO_poller* s) {
 		while (t != &s->main) {
 			dv_free(t->changes);
 			dv_free(t->events);
-            t = t->next;
-            free(t->prev);
+			t = t->next;
+			free(t->prev);
 		}
 
 		pthread_key_delete(s->key);
@@ -143,69 +160,13 @@ void BIO_free_poller(BIO_poller* s) {
 		dv_free(s->main.events);
 	}
 
-    close(s->kq);
+	close(s->kq);
 	free(s);
 }
 
 void BIO_exit_poll(BIO_poller* s, int exitcode) {
 	s->die = 1;
 	s->exit_code = exitcode;
-}
-
-static void do_write(struct poll* p, struct kevent* e);
-
-static void do_read(struct poll* p, struct kevent* e) {
-	if (!p || !p->wait_read) {
-		return;
-	}
-
-	p->read_after_write = 0;
-	p->in_read = 1;
-
-	if (p->read_cb) {
-		p->read_cb(p->read_arg);
-	}
-
-	if (e->udata == NULL) {
-		return;
-	}
-
-	p->in_read = 0;
-
-	if (!p->wait_read) {
-		update_read(p, 0);
-	}
-
-	if (p->write_after_read) {
-		do_write(p, e);
-	}
-}
-
-static void do_write(struct poll* p, struct kevent* e) {
-	if (!p || !p->wait_write) {
-		return;
-	}
-
-	p->write_after_read = 0;
-	p->in_write = 1;
-
-	if (p->write_cb) {
-		p->write_cb(p->write_arg);
-	}
-
-	if (e->udata == NULL) {
-		return;
-	}
-
-	p->in_write = 0;
-
-	if (!p->wait_write) {
-		update_write(p, 0);
-	}
-
-	if (p->read_after_write) {
-		do_read(p, e);
-	}
 }
 
 #define NS INT64_C(1000000000)
@@ -234,10 +195,10 @@ int BIO_poll(BIO_poller* s, int64_t timeoutns) {
 
 		ret = kevent(s->kq,
 				t->changes.data,
-			       	t->changes.size,
-			       	t->events.data,
-			       	t->events.size,
-			       	pto);
+				t->changes.size,
+				t->events.data,
+				t->events.size,
+				pto);
 
 		dv_resize(&t->changes, 0);
 
@@ -250,12 +211,56 @@ int BIO_poll(BIO_poller* s, int64_t timeoutns) {
 		for (i = 0; i < ret; i++) {
 			struct kevent* e = &t->events.data[i];
 			struct poll* p = (struct poll*) e->udata;
+			int read, write;
+
+			if (p == NULL) {
+				continue;
+			}
+
+			read = p->wait_read;
+			write = p->wait_write;
+			p->in_callback = 1;
 
 			if (e->filter == EVFILT_READ) {
-				do_read(p, e);
+				if (p->read && p->read_cb) {
+					p->read_cb(p->read_arg);
+				}
+
+				if (e->udata == NULL) {
+					continue;
+				}
+
+				if (p->write_after_read && p->write_cb) {
+					p->write_cb(p->write_arg);
+				}
+
 			} else {
-				do_write(p, e);
+				if (p->write && p->write_cb) {
+					p->write_cb(p->write_arg);
+				}
+
+				if (e->udata == NULL) {
+					continue;
+				}
+
+				if (p->read_after_write && p->read_cb) {
+					p->read_cb(p->read_arg);
+				}
 			}
+
+			if (e->udata == NULL) {
+				continue;
+			}
+
+			p->in_callback = 0;
+
+			read2 = p->wait_read;
+			write2 = p->wait_write;
+
+			p->wait_read = read;
+			p->wait_write = write;
+
+			update_poll(p, read2, write2);
 		}
 
 		if (pto) {

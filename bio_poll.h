@@ -19,7 +19,6 @@ enum {
 };
 
 BIO_METHOD* BIO_f_poll(void);
-BIO* BIO_new_poll(BIO_poller* p);
 #define BIO_set_poller(b,p) BIO_ctrl(b, BIO_C_SET_POLLER, 0, p)
 
 typedef void (*BIO_poll_fn)(void*);

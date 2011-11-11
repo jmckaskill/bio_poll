@@ -25,12 +25,6 @@ static BIO_METHOD poll_method = {
 	&poll_callback_ctrl,
 };
 
-BIO* BIO_new_poll(BIO_poller* p) {
-	BIO* b = BIO_new(BIO_f_poll());
-	BIO_set_poller(b, p);
-	return b;
-}
-
 BIO_METHOD* BIO_f_poll(void) {
 	return &poll_method;
 }
@@ -54,9 +48,6 @@ static void disconnect(struct poll* s, BIO* next) {
 	}
 
 	s->fd = -1;
-	s->wait_read = 0;
-	s->wait_write = 0;
-	s->registered = 0;
 	s->read = 0;
 	s->write = 0;
 	s->read_after_write = 0;
@@ -76,7 +67,7 @@ static int poll_free(BIO* b) {
 	return 1;
 }
 
-static int update_poll(struct poll* s, BIO* next, int ret) {
+static int on_either(struct poll* s, BIO* next, int ret) {
 	int read = s->read || s->write_after_read;
 	int write = s->write || s->read_after_write;
 
@@ -87,16 +78,7 @@ static int update_poll(struct poll* s, BIO* next, int ret) {
 
 	/* success - turn off wait */
 	if (ret > 0) {
-		if (read != s->wait_read && !s->in_read) {
-			update_read(s, read);
-		}
-
-		if (write != s->wait_write && !s->in_write) {
-			update_write(s, write);
-		}
-		
-		s->wait_write = write;
-		s->wait_read = read;
+		update_poll(s, read, write);
 		return ret;
 	}
 
@@ -128,28 +110,9 @@ static int update_poll(struct poll* s, BIO* next, int ret) {
 		if (s->fd < 0) {
 			return ret;
 		}
-		
-		BIO_set_nbio(next, 1);
 	}
 
-	read = s->read || s->write_after_read;
-	write = s->write || s->read_after_write;
-
-	if (!s->registered) {
-		add_poll(s, read, write);
-		s->registered = 1;
-	} else {
-		if (read != s->wait_read && !s->in_read) {
-			update_read(s, read);
-		}
-
-		if (write != s->wait_write && !s->in_write) {
-			update_write(s, write);
-		}
-	}
-
-	s->wait_read = read;
-	s->wait_write = write;
+	update_poll(s, read, write);
 
 	return ret;
 }
@@ -162,7 +125,7 @@ static int on_read(struct poll* s, BIO* next, int ret) {
 	s->read_after_write = ret <= 0 && (BIO_should_write(next) || should_connect(next));
 	s->read_finished = ret <= 0 && !BIO_should_retry(next);
 
-	return update_poll(s, next, ret);
+	return on_either(s, next, ret);
 }
 
 static int on_write(struct poll* s, BIO* next, int ret) {
@@ -170,7 +133,7 @@ static int on_write(struct poll* s, BIO* next, int ret) {
 	s->write_after_read = ret <= 0 && (BIO_should_read(next) || should_accept(next));
 	s->write_finished = ret <= 0 && !BIO_should_retry(next);
 
-	return update_poll(s, next, ret);
+	return on_either(s, next, ret);
 }
 
 static int poll_gets(BIO* b, char* buf, int sz) {
@@ -276,6 +239,9 @@ static long poll_ctrl(BIO* b, int cmd, long larg, void* parg) {
 	case BIO_C_SET_POLLER:
 		disconnect(s, next);
 		s->poller = (BIO_poller*) parg;
+		if (parg) {
+			BIO_set_nbio(next, 1);
+		}
 		return 1;
 
 	case BIO_CTRL_FLUSH:
@@ -297,7 +263,7 @@ static long poll_ctrl(BIO* b, int cmd, long larg, void* parg) {
 		s->write_after_read = 0;
 		s->write_finished = 1;
 
-		return update_poll(s, next, (int) ret);
+		return on_either(s, next, (int) ret);
 
 	default:
 		return BIO_ctrl(next, cmd, larg, parg);
